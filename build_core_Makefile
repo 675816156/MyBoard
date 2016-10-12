@@ -1,0 +1,13 @@
+diff --git a/core/Makefile b/core/Makefile
+index d804c37..8610491 100644
+--- a/core/Makefile
++++ b/core/Makefile
+@@ -497,7 +497,7 @@ ifneq ($(BOARD_BUILD_SYSTEM_ROOT_IMAGE),true)
+ INTERNAL_BOOTIMAGE_ARGS += --ramdisk $(INSTALLED_RAMDISK_TARGET)
+ endif
+ 
+-INTERNAL_BOOTIMAGE_FILES := $(filter-out --%,$(INTERNAL_BOOTIMAGE_ARGS))
++INTERNAL_BOOTIMAGE_FILES := $(filter-out --%,$(INTERNAL_BOOTIMAGE_ARGS)) $(INSTALLED_DTB_TARGET)
+ 
+ BOARD_KERNEL_CMDLINE := $(strip $(BOARD_KERNEL_CMDLINE))
+ ifdef BOARD_KERNEL_CMDLINE
