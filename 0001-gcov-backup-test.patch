@@ -1,0 +1,174 @@
+From 4c7f48df2489d6847f9260261f9bfde4789c2805 Mon Sep 17 00:00:00 2001
+From: Chen Jun <675816156@qq.com>
+Date: Wed, 14 Jun 2017 11:04:59 -0700
+Subject: [PATCH] gcov backup test
+
+---
+ arch/arm64/configs/hikey_defconfig |   2 +
+ kernel/gcov/Makefile               |   1 +
+ kernel/gcov/fs.c                   |   3 +
+ kernel/gcov/gcov_backup.c          | 109 +++++++++++++++++++++++++++++++++++++
+ mm/Makefile                        |   1 +
+ 5 files changed, 116 insertions(+)
+ create mode 100644 kernel/gcov/gcov_backup.c
+
+diff --git a/arch/arm64/configs/hikey_defconfig b/arch/arm64/configs/hikey_defconfig
+index e3919ce..a982669 100644
+--- a/arch/arm64/configs/hikey_defconfig
++++ b/arch/arm64/configs/hikey_defconfig
+@@ -526,3 +526,5 @@ CONFIG_CRYPTO_AES_ARM64_CE_BLK=y
+ CONFIG_CRYPTO_AES_ARM64_NEON_BLK=y
+ CONFIG_CRC_CCITT=y
+ CONFIG_CRC_T10DIF=y
++CONFIG_GCOV_KERNEL=y
++CONFIG_GCOV_FORMAT_AUTODETECT=y
+diff --git a/kernel/gcov/Makefile b/kernel/gcov/Makefile
+index 752d648..6f5d98b 100644
+--- a/kernel/gcov/Makefile
++++ b/kernel/gcov/Makefile
+@@ -5,3 +5,4 @@ obj-$(CONFIG_GCOV_FORMAT_3_4) += gcc_3_4.o
+ obj-$(CONFIG_GCOV_FORMAT_4_7) += gcc_4_7.o
+ obj-$(CONFIG_GCOV_FORMAT_AUTODETECT) += $(call cc-ifversion, -lt, 0407, \
+ 							gcc_3_4.o, gcc_4_7.o)
++obj-y += gcov_backup.o
+diff --git a/kernel/gcov/fs.c b/kernel/gcov/fs.c
+index edf67c4..0972979 100644
+--- a/kernel/gcov/fs.c
++++ b/kernel/gcov/fs.c
+@@ -754,6 +754,9 @@ void gcov_event(enum gcov_action action, struct gcov_info *info)
+ 		}
+ 		break;
+ 	}
++void gcov_backup(struct gcov_inf *info);
++	gcov_backup(info);
++	printk(KERN_ERR"chenjun %s \n", gcov_info_filename(info));
+ 	mutex_unlock(&node_lock);
+ }
+ 
+diff --git a/kernel/gcov/gcov_backup.c b/kernel/gcov/gcov_backup.c
+new file mode 100644
+index 0000000..24b06a5
+--- /dev/null
++++ b/kernel/gcov/gcov_backup.c
+@@ -0,0 +1,109 @@
++/*
++ * =====================================================================================
++ *
++ *       Filename:  gcov_backup.c
++ *
++ *    Description:
++ *
++ *        Version:  1.0
++ *        Created:  06/14/2017 08:03:03 AM
++ *       Revision:  none
++ *       Compiler:  gcc
++ *
++ *         Author:  YOUR NAME (),
++ *   Organization:
++ *
++ * =====================================================================================
++ */
++#include <linux/delay.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/list.h>
++#include <linux/workqueue.h>
++#include <linux/semaphore.h>
++#include <linux/string.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/syscalls.h>
++#include <linux/vmalloc.h>
++#include "gcov.h"
++
++struct gcov_iterator {
++	struct gcov_info *info;
++	void *buffer;
++	size_t size;
++	loff_t pos;
++};
++
++struct gcov_file {
++	struct list_head list;
++	struct gcov_iterator *piter;
++};
++
++static LIST_HEAD(gcov_data);
++static DEFINE_SPINLOCK(gcov_lock);
++static struct semaphore gcov_backup_sem = __SEMAPHORE_INITIALIZER(gcov_backup_sem, 0);
++
++static void do_gcda_backup(struct gcov_iterator *piter)
++{
++	char buf[256] = {0};
++
++	struct file *filp;
++
++	snprintf(buf, 256, "/data%s", gcov_info_filename(piter->info));
++
++	filp = filp_open(buf, O_RDWR|O_CREAT, 0777);
++	if (IS_ERR(filp)) {
++		pr_err("fail to create %s\n", buf);
++		return;
++	}
++	filp_close(filp, NULL);
++}
++
++static void gcov_backup_work_func(struct work_struct *wk)
++{
++	struct kstat stat;
++	struct gcov_iterator *piter;
++	struct gcov_file *gfile, *n;
++
++	while (1) {
++		down(&gcov_backup_sem);
++
++		msleep(20000);
++
++		spin_lock(&gcov_lock);
++		list_for_each_entry_safe(gfile, n, &gcov_data, list) {
++			piter = gfile->piter;
++
++			do_gcda_backup(piter);
++
++			list_del(&gfile->list);
++			gcov_iter_free(piter);
++			kfree(gfile);
++		}
++		spin_unlock(&gcov_lock);
++	}
++}
++
++static DECLARE_WORK(gcov_backup_work, gcov_backup_work_func);
++
++void gcov_backup(struct gcov_info *info)
++{
++	struct gcov_file *gfile;
++
++	schedule_work(&gcov_backup_work);
++
++	gfile = kzalloc(sizeof(*gfile), GFP_KERNEL);
++	if (gfile == NULL) {
++		pr_err("fail to alloc gfile\n");
++		return;
++	}
++
++	gfile->piter = gcov_iter_new(info);
++
++	spin_lock(&gcov_lock);
++	list_add(&gfile->list, &gcov_data);
++	spin_unlock(&gcov_lock);
++
++	up(&gcov_backup_sem);
++}
+diff --git a/mm/Makefile b/mm/Makefile
+index 8b532c9..6f40c87d 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -85,3 +85,4 @@ obj-$(CONFIG_USERFAULTFD) += userfaultfd.o
+ obj-$(CONFIG_IDLE_PAGE_TRACKING) += page_idle.o
+ obj-$(CONFIG_FRAME_VECTOR) += frame_vector.o
+ obj-$(CONFIG_HARDENED_USERCOPY) += usercopy.o
++GCOV_PROFILE := y
+-- 
+2.7.4
+
