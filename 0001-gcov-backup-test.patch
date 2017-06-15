@@ -1,4 +1,4 @@
-From 4c7f48df2489d6847f9260261f9bfde4789c2805 Mon Sep 17 00:00:00 2001
+From 3cce72cbb599edcc2c2633d21819bbbd7c039593 Mon Sep 17 00:00:00 2001
 From: Chen Jun <675816156@qq.com>
 Date: Wed, 14 Jun 2017 11:04:59 -0700
 Subject: [PATCH] gcov backup test
@@ -7,9 +7,9 @@ Subject: [PATCH] gcov backup test
  arch/arm64/configs/hikey_defconfig |   2 +
  kernel/gcov/Makefile               |   1 +
  kernel/gcov/fs.c                   |   3 +
- kernel/gcov/gcov_backup.c          | 109 +++++++++++++++++++++++++++++++++++++
+ kernel/gcov/gcov_backup.c          | 138 +++++++++++++++++++++++++++++++++++++
  mm/Makefile                        |   1 +
- 5 files changed, 116 insertions(+)
+ 5 files changed, 145 insertions(+)
  create mode 100644 kernel/gcov/gcov_backup.c
 
 diff --git a/arch/arm64/configs/hikey_defconfig b/arch/arm64/configs/hikey_defconfig
@@ -47,10 +47,10 @@ index edf67c4..0972979 100644
  
 diff --git a/kernel/gcov/gcov_backup.c b/kernel/gcov/gcov_backup.c
 new file mode 100644
-index 0000000..24b06a5
+index 0000000..0ee8ad7
 --- /dev/null
 +++ b/kernel/gcov/gcov_backup.c
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,138 @@
 +/*
 + * =====================================================================================
 + *
@@ -69,6 +69,7 @@ index 0000000..24b06a5
 + * =====================================================================================
 + */
 +#include <linux/delay.h>
++#include <linux/fs.h>
 +#include <linux/init.h>
 +#include <linux/module.h>
 +#include <linux/list.h>
@@ -79,6 +80,8 @@ index 0000000..24b06a5
 +#include <linux/spinlock.h>
 +#include <linux/syscalls.h>
 +#include <linux/vmalloc.h>
++#include <asm/unistd.h>
++#include <asm/uaccess.h>
 +#include "gcov.h"
 +
 +struct gcov_iterator {
@@ -97,32 +100,58 @@ index 0000000..24b06a5
 +static DEFINE_SPINLOCK(gcov_lock);
 +static struct semaphore gcov_backup_sem = __SEMAPHORE_INITIALIZER(gcov_backup_sem, 0);
 +
++static void gcov_mkdir(char *path)
++{
++        char *s = path;
++
++        while (*s) {
++                if (*s == '/') {
++                        *s = 0;
++                        if (sys_access(path, 0)) {
++                                sys_mkdir(path, 0777);
++                        }
++                        *s = '/';
++                }
++                ++s;
++        }
++}
++
 +static void do_gcda_backup(struct gcov_iterator *piter)
 +{
++	mm_segment_t old_fs;
 +	char buf[256] = {0};
 +
 +	struct file *filp;
 +
-+	snprintf(buf, 256, "/data%s", gcov_info_filename(piter->info));
++	old_fs = get_fs();
++	set_fs(KERNEL_DS);
 +
-+	filp = filp_open(buf, O_RDWR|O_CREAT, 0777);
++	snprintf(buf, 256, "/data/coverage%s", gcov_info_filename(piter->info));
++
++	gcov_mkdir(buf);
++	pr_err("create dir = %s\n", buf);
++
++	filp = filp_open(buf, O_RDWR | O_CREAT, 0777);
 +	if (IS_ERR(filp)) {
 +		pr_err("fail to create %s\n", buf);
-+		return;
++		goto out;
 +	}
++
 +	filp_close(filp, NULL);
++out:
++	set_fs(old_fs);
 +}
 +
 +static void gcov_backup_work_func(struct work_struct *wk)
 +{
-+	struct kstat stat;
 +	struct gcov_iterator *piter;
 +	struct gcov_file *gfile, *n;
 +
 +	while (1) {
 +		down(&gcov_backup_sem);
 +
-+		msleep(20000);
++		while (sys_access((const char __user *)"/data", 0) != 0)
++			msleep(100);
 +
 +		spin_lock(&gcov_lock);
 +		list_for_each_entry_safe(gfile, n, &gcov_data, list) {
