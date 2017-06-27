@@ -1,0 +1,286 @@
+From 50175bc02f1bbeef028e2d7a1884d17833f59c98 Mon Sep 17 00:00:00 2001
+From: Chen Jun <675816156@qq.com>
+Date: Tue, 27 Jun 2017 13:22:01 -0700
+Subject: [PATCH] gcov data backup version 0.2
+
+Change-Id: I7f5bb3c4323a0cc4c1b15412701a014d98bfe000
+---
+ gcov_backup/Android.mk     |  21 ++++++
+ gcov_backup/gcov_service.c | 182 +++++++++++++++++++++++++++++++++++++++++++++
+ hikey/BoardConfig.mk       |   1 +
+ init.common.rc             |   9 +++
+ sepolicy/file_contexts     |   1 +
+ sepolicy/gcov_service.te   |   3 +
+ 6 files changed, 217 insertions(+)
+ create mode 100644 gcov_backup/Android.mk
+ create mode 100644 gcov_backup/gcov_service.c
+ create mode 100644 sepolicy/gcov_service.te
+
+diff --git a/gcov_backup/Android.mk b/gcov_backup/Android.mk
+new file mode 100644
+index 0000000..7cfad74
+--- /dev/null
++++ b/gcov_backup/Android.mk
+@@ -0,0 +1,21 @@
++# Copyright 2011 The Android Open Source Project
++
++LOCAL_PATH:= $(call my-dir)
++include $(CLEAR_VARS)
++
++LOCAL_SRC_FILES:= gcov_service.c
++
++LOCAL_MODULE:= gcov_service
++LOCAL_PROPRIETARY_MODULE := true
++
++LOCAL_MODULE_TAGS := eng
++LOCAL_FORCE_STATIC_EXECUTABLE := true
++
++LOCAL_CFLAGS := -Werror
++
++LOCAL_STATIC_LIBRARIES := \
++    libcutils \
++    liblog \
++    libc
++
++include $(BUILD_EXECUTABLE)
+diff --git a/gcov_backup/gcov_service.c b/gcov_backup/gcov_service.c
+new file mode 100644
+index 0000000..f7d0860
+--- /dev/null
++++ b/gcov_backup/gcov_service.c
+@@ -0,0 +1,182 @@
++/*
++ *  gcov_service.c
++ *
++ * backup gcov data service
++ *
++ *   Copyright 2017 Google, Inc
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++#define LOG_TAG "gcov_service"
++
++#include <signal.h>
++#include <string.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <sys/wait.h>
++#include <dirent.h>
++
++#include <log/log.h>
++
++#define MODE (00777)
++#define GCOV_PATH "/sys/kernel/debug/gcov"
++#define GCOV_BACKUP_PATH "/data/coverage"
++#define BUF_SZ (1024)
++#define MAX_PATH (1024)
++#define GET_4WIDTH(n) ((n) % 10000)
++
++static long int get_rand(void)
++{
++	long int rand;
++	unsigned int seed;
++
++	seed = (unsigned int)time(NULL);
++	srandom(seed);
++
++	rand = GET_4WIDTH(random());
++
++	return rand;
++}
++
++static void waitfor_data_partition(void)
++{
++	while (access("/data/lost+found", 0)) {
++		sleep(1);
++	}
++}
++
++static void xmkdir(char *path)
++{
++        char *s = path;
++
++        while (*s) {
++                if (*s == '/') {
++                        *s = 0;
++                        if (strlen(path) && access(path, 0)) {
++                                mkdir(path, 0777);
++                        }
++                        *s = '/';
++                }
++                ++s;
++        }
++}
++
++static void copy_file(char *src, char *dst)
++{
++	char *p;
++	char dest[MAX_PATH] = {0};
++	char buffer[BUF_SZ] = {0};
++	FILE *in, *out;
++	size_t len;
++
++	p = src + strlen(GCOV_PATH);
++	snprintf(dest, MAX_PATH, "%s/%s", dst, p);
++	xmkdir(dest);
++
++	if((in = fopen(src, "r")) == NULL) {
++		ALOGE("open %s error\n", src);
++		goto src_open_err;
++	}
++
++	if((out = fopen(dest, "w")) == NULL) {
++		ALOGE("open %s error\n", dest);
++		goto dst_open_err;
++	}
++
++	while((len = fread(buffer, sizeof(char), BUF_SZ, in)) > 0) {
++		if (len != fwrite(buffer, 1, len, out)) {
++			ALOGE("copy %s to %s error\n", src, dest);
++			goto copy_err;
++		}
++	}
++
++copy_err:
++	fclose(out);
++dst_open_err:
++	fclose(in);
++src_open_err:
++	return;
++}
++
++void walk_dir(char *path, char *dst)
++{
++	struct dirent *ent = NULL;
++	DIR *pDir;
++	char pname[MAX_PATH] = {0};
++
++	if((pDir = opendir(path)) == NULL) {
++		ALOGE("fail to opendir %s\n", path);
++		return;
++	}
++
++	while(NULL != (ent = readdir(pDir)))
++	{
++		if (ent->d_name[0] == '.')
++			continue;
++
++		snprintf(pname, MAX_PATH, "%s/%s", path, ent->d_name);
++		if(ent->d_type == DT_REG) {
++			copy_file(pname, dst);
++		} else if (ent->d_type == DT_DIR) {
++			walk_dir(pname, dst);
++		}
++	}
++	closedir(pDir);
++}
++
++static void sig_handler(int sig)
++{
++	int ret = 0;
++	long int rand;
++	char cmd[BUF_SZ] = {0};
++	char name[BUF_SZ] = {0};
++
++	if (sig != SIGTERM)
++		return;
++
++	if (access(GCOV_BACKUP_PATH, 0)) {
++		ret = mkdir(GCOV_BACKUP_PATH, MODE);
++		if (ret) {
++			ALOGE("mkdir fail ret = %d\n", ret);
++			exit(EXIT_FAILURE);
++		}
++	}
++
++	rand = get_rand();
++	snprintf(name, BUF_SZ, "%s/gcov_%04ld", GCOV_BACKUP_PATH, rand);
++	walk_dir(GCOV_PATH, name);
++	exit(EXIT_SUCCESS);
++}
++
++int main(void)
++{
++	int ret;
++	struct sigaction act, oldact;
++
++	waitfor_data_partition();
++	ALOGI("waitfor_data_partition finished\n");
++
++	memset(&act, 0, sizeof(struct sigaction));
++	act.sa_handler = sig_handler;
++	ret = sigaction(SIGTERM, &act, &oldact);
++	if (ret < 0) {
++		ALOGE("fail to set signal handler\n");
++		return ret;
++	}
++
++	while (1) sleep(1);
++	return 0;
++}
+diff --git a/hikey/BoardConfig.mk b/hikey/BoardConfig.mk
+index df97048..61b5db5 100644
+--- a/hikey/BoardConfig.mk
++++ b/hikey/BoardConfig.mk
+@@ -7,6 +7,7 @@ else
+ BOARD_KERNEL_CMDLINE := console=ttyFIQ0 androidboot.console=ttyFIQ0 androidboot.hardware=hikey firmware_class.path=/system/etc/firmware efi=noruntime
+ endif
+ 
++BOARD_KERNEL_CMDLINE += androidboot.selinux=permissive
+ ## printk.devkmsg only has meaning for kernel 4.9 and later
+ ## it would be ignored by kernel 3.18 and kernel 4.4
+ BOARD_KERNEL_CMDLINE += printk.devkmsg=on
+diff --git a/init.common.rc b/init.common.rc
+index 41f582a..475412d 100644
+--- a/init.common.rc
++++ b/init.common.rc
+@@ -86,6 +86,15 @@ service uim /vendor/bin/uim
+     group bluetooth net_bt_admin system
+     oneshot
+ 
++service gcov_service /vendor/bin/gcov_service
++    class main
++    user root
++    group root
++    disabled
++
++on property:service.bootanim.exit=1
++    start gcov_service
++
+ service wpa_supplicant /system/vendor/bin/hw/wpa_supplicant \
+      -iwlan0 -Dnl80211 -c/data/misc/wifi/wpa_supplicant.conf \
+      -e/data/misc/wifi/entropy.bin  -g@android:wpa_wlan0
+diff --git a/sepolicy/file_contexts b/sepolicy/file_contexts
+index 6d91f79..44f9316 100644
+--- a/sepolicy/file_contexts
++++ b/sepolicy/file_contexts
+@@ -9,3 +9,4 @@
+ /dev/ttyAMA4           u:object_r:hci_attach_dev:s0
+ /system/vendor/bin/uim u:object_r:hci_attach_exec:s0
+ /system/vendor/bin/hw/android\.hardware\.bluetooth@1\.0-service\.hikey      u:object_r:hal_bluetooth_hikey_exec:s0
++/system/vendor/bin/gcov_service u:object_r:gcov_service_exec:s0
+diff --git a/sepolicy/gcov_service.te b/sepolicy/gcov_service.te
+new file mode 100644
+index 0000000..ca2d76a
+--- /dev/null
++++ b/sepolicy/gcov_service.te
+@@ -0,0 +1,3 @@
++type gcov_service, domain;
++type gcov_service_exec, exec_type, file_type;
++init_daemon_domain(gcov_service);
+-- 
+2.7.4
+
